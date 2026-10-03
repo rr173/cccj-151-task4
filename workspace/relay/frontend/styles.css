@@ -89,6 +89,7 @@ pre.result {
 .badge.dispatching, .badge.retry_wait, .badge.forwarding { background: #f5f3ff; color: #6d28d9; }
 .badge.rejected_terminal, .badge.blocked_terminal { background: var(--red-bg); color: var(--red); }
 .badge.idle { background: #f1f5f9; color: var(--gray); }
+.badge.archived { background: #e2e8f0; color: var(--gray); }
 .metrics { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 12px; }
 .metric { background: var(--gray-bg); border-radius: 6px; padding: 3px 8px; }
 .metric b { font-size: 13px; }
@@ -122,5 +123,13 @@ code {
 }
 .blocker-box {
   border: 1px solid #fecaca; background: var(--red-bg); color: var(--red);
+  border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 13px;
+}
+.archive-notice {
+  border: 1px solid var(--border); background: var(--gray-bg); color: var(--gray);
+  border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 13px;
+}
+.ok-box {
+  border: 1px solid #bbf7d0; background: var(--green-bg); color: var(--green);
   border-radius: 8px; padding: 10px 12px; margin: 10px 0; font-size: 13px;
 }

@@ -35,6 +35,12 @@ function fmtTs(ts) {
   const d = new Date(ts * 1000);
   return d.toLocaleString("zh-CN", { hour12: false });
 }
+function fmtBytes(n) {
+  if (n === null || n === undefined) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -56,6 +62,7 @@ document.querySelectorAll(".topbar nav button").forEach((btn) => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "terminal") loadTerminal();
     if (btn.dataset.tab === "retries") loadQueue();
+    if (btn.dataset.tab === "archive") loadArchiveTab();
     if (btn.dataset.tab === "audit") loadAudit();
     if (btn.dataset.tab === "stub") loadStub();
   });
@@ -94,18 +101,26 @@ async function loadBatches() {
       const blocker = b.blocker
         ? `<div class="gapline">⛔ 游标冻结于序号 ${b.blocker.seq}（${esc(b.blocker.result_code)}），后续不得越过</div>`
         : "";
+      const metrics = b.archived
+        ? `<div class="metrics">
+            <span class="metric">已归档回执 <b>${b.archive ? b.archive.receipt_count : 0}</b></span>
+            <span class="metric">回收空间 <b>${fmtBytes(b.archive ? b.archive.freed_bytes : 0)}</b></span>
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:6px">🗄️ 已封存为只读归档
+            ${b.archive ? "· 封存于 " + fmtTs(b.archive.sealed_at) : ""}</div>`
+        : `<div class="metrics">
+            <span class="metric">已转发 <b>${c.forwarded}</b></span>
+            <span class="metric">待转发 <b>${c.queued}</b></span>
+            <span class="metric">缓冲 <b>${c.buffered}</b></span>
+            <span class="metric">重试中 <b>${c.retry_wait + c.dispatching}</b></span>
+            <span class="metric">终态拒绝 <b class="${c.rejected_terminal ? "err-text" : ""}">${c.rejected_terminal}</b></span>
+          </div>
+          ${gapTxt}${blocker}`;
       return `<div class="card" data-ref="${esc(b.batch_ref)}">
         <h4>${esc(b.batch_ref)} <span class="badge ${b.status}">${statusText(b.status)}</span></h4>
         <div class="sub">${esc(b.batch_summary)}</div>
         <div class="sub mono">hash ${esc(b.content_hash.slice(0, 16))}… · 导入于 ${fmtTs(b.imported_at)}</div>
-        <div class="metrics">
-          <span class="metric">已转发 <b>${c.forwarded}</b></span>
-          <span class="metric">待转发 <b>${c.queued}</b></span>
-          <span class="metric">缓冲 <b>${c.buffered}</b></span>
-          <span class="metric">重试中 <b>${c.retry_wait + c.dispatching}</b></span>
-          <span class="metric">终态拒绝 <b class="${c.rejected_terminal ? "err-text" : ""}">${c.rejected_terminal}</b></span>
-        </div>
-        ${gapTxt}${blocker}
+        ${metrics}
       </div>`;
     }).join("");
     box.querySelectorAll(".card").forEach((card) =>
@@ -116,7 +131,8 @@ async function loadBatches() {
 
 function statusText(s) {
   return { idle: "等待回执", collecting: "收集中", forwarding: "转发中",
-           blocked_terminal: "终态阻塞", all_forwarded: "全部转发完成" }[s] || s;
+           blocked_terminal: "终态阻塞", all_forwarded: "全部转发完成",
+           archived: "已封存(只读)" }[s] || s;
 }
 
 async function loadBatchDetail(ref) {
@@ -131,6 +147,20 @@ async function loadBatchDetail(ref) {
   const buffered = b.buffered_items.length
     ? `<div><b>缓冲项（持久等待缺口）：</b> ${b.buffered_items.map((x) =>
         `<span class="badge buffered">#${x.seq} ${esc(x.receipt_no)}</span>`).join(" ")}</div>` : "";
+  const archivedBox = b.archived
+    ? `<div class="archive-notice">🗄️ <b>该批次已封存为只读归档</b>
+        ${b.archive ? `（封存于 ${fmtTs(b.archive.sealed_at)}，回收 ${fmtBytes(b.archive.freed_bytes)}）` : ""}。
+        校验摘要 <code>${esc(b.archive ? b.archive.digest.slice(0, 24) : "")}…</code>；
+        以下明细来自归档快照，不再进入转发队列。可去「归档封存」页下载完整归档。</div>` : "";
+  const auditSection = (b.archived && b.audit && b.audit.length)
+    ? `<h3>原审计时间线（随归档保留）</h3>
+       <table class="tbl"><thead><tr><th>时间</th><th>事件</th><th>序号</th>
+         <th>回执号</th><th>操作者</th><th>细节</th></tr></thead>
+       <tbody>${b.audit.map((e) => `<tr>
+         <td class="mono">${fmtTs(e.ts)}</td><td>${esc(e.kind)}</td>
+         <td>${e.seq ?? ""}</td><td>${esc(e.receipt_no)}</td><td>${esc(e.actor)}</td>
+         <td class="mono" style="max-width:360px;word-break:break-all">${esc(e.detail)}</td>
+       </tr>`).join("")}</tbody></table>` : "";
   const rows = b.receipts.map((r) => `<tr>
       <td>${r.seq}</td>
       <td>${esc(r.receipt_no)}</td>
@@ -152,11 +182,12 @@ async function loadBatchDetail(ref) {
     </div>
     <p class="hint">${esc(b.batch_summary)} · 游标 next_seq=<b>${b.cursor}</b>
       · 最大已见序号 ${b.max_seen ?? "—"} · 缺口 [${b.gaps.join(", ") || "无"}]</p>
-    ${blocked}${buffered}
+    ${archivedBox}${blocked}${buffered}
     <table class="tbl"><thead><tr>
       <th>序号</th><th>回执号</th><th>类型</th><th>状态</th><th>尝试</th>
       <th>转发结果 / 失败原因</th><th>时间</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="7" class="muted">尚无回执</td></tr>`}</tbody></table>`;
+      <tbody>${rows || `<tr><td colspan="7" class="muted">尚无回执</td></tr>`}</tbody></table>
+    ${auditSection}`;
 }
 
 // ------------------------------------------------------------ 执行包导入
@@ -197,7 +228,7 @@ $("importBtn").onclick = async () => {
 async function loadTerminal() {
   const d = await api("/terminal/manifest");
   $("terminalRows").innerHTML = d.batches.map((b) => `<tr>
-    <td><b>${esc(b.batch_ref)}</b></td>
+    <td><b>${esc(b.batch_ref)}</b>${b.archived ? ' <span class="badge archived">已封存</span>' : ""}</td>
     <td>${esc(b.batch_summary)}</td>
     <td class="mono">${esc(b.content_hash.slice(0, 20))}…</td>
     <td>${b.forwarded_receipts}</td>
@@ -282,6 +313,109 @@ async function loadQueue() {
 }
 $("queueRefresh").onclick = loadQueue;
 
+// ------------------------------------------------------------ 归档封存
+async function loadArchiveTab() {
+  const [s, a] = await Promise.all([api("/admin/storage"), api("/archives")]);
+  const t = s.totals;
+  $("storageTotals").innerHTML =
+    `<span class="metric">热库占用 <b>${fmtBytes(t.hot_bytes)}</b></span>
+     <span class="metric">可封存批次 <b>${t.sealable}</b></span>
+     <span class="metric">已封存 <b>${t.archived}</b></span>
+     <span class="metric">累计回收 <b>${fmtBytes(t.freed_bytes)}</b></span>
+     <span class="metric">归档体积 <b>${fmtBytes(t.archive_bytes)}</b></span>`;
+  $("storageRows").innerHTML = s.batches.map((b) => {
+    if (b.archived) {
+      return `<tr><td><b>${esc(b.batch_ref)}</b></td>
+        <td colspan="3" class="muted">热库明细已迁入只读归档</td>
+        <td><span class="badge archived">已封存</span></td>
+        <td class="muted">已回收 ${fmtBytes(b.archive ? b.archive.freed_bytes : 0)}</td></tr>`;
+    }
+    const eligible = b.sealable
+      ? `<span class="badge forwarded">✓ 可封存</span>`
+      : `<div class="err-text" style="font-size:12px">${b.reasons.map((r) => esc(r.message)).join("<br>")}</div>`;
+    const action = b.sealable
+      ? `<button class="warn" data-ref="${esc(b.batch_ref)}">执行封存</button>`
+      : `<span class="muted">—</span>`;
+    return `<tr><td><b>${esc(b.batch_ref)}</b></td>
+      <td>${b.receipt_count} 条 / ${fmtBytes(b.receipt_bytes)}</td>
+      <td>${b.audit_count} 行 / ${fmtBytes(b.audit_bytes)}</td>
+      <td><b>${fmtBytes(b.hot_bytes)}</b></td>
+      <td>${eligible}</td><td>${action}</td></tr>`;
+  }).join("") || `<tr><td colspan="6" class="muted">暂无批次</td></tr>`;
+  $("storageRows").querySelectorAll("button[data-ref]").forEach((btn) =>
+    btn.addEventListener("click", () => sealBatch(btn.dataset.ref)));
+
+  $("archiveRows").innerHTML = a.archives.map((x) => `<tr>
+    <td><b>${esc(x.batch_ref)}</b></td>
+    <td class="mono" title="${esc(x.digest)}">${esc(x.digest.slice(0, 20))}…</td>
+    <td>${x.receipt_count}</td><td>${x.audit_count}</td>
+    <td>${fmtBytes(x.freed_bytes)}</td><td>${fmtTs(x.sealed_at)}</td>
+    <td><button data-view="${esc(x.batch_ref)}">校验并查看</button>
+      <a class="btnlike" href="/relay/api/archives/${encodeURIComponent(x.batch_ref)}/download">下载</a></td>
+  </tr>`).join("") || `<tr><td colspan="7" class="muted">暂无归档</td></tr>`;
+  $("archiveRows").querySelectorAll("button[data-view]").forEach((btn) =>
+    btn.addEventListener("click", () => viewArchive(btn.dataset.view)));
+}
+
+async function sealBatch(ref) {
+  const note = prompt(`确认封存批次 ${ref}？\n` +
+    "热库回执明细与审计时间线将迁入只读归档（不可撤销）。可附备注：", "定期空间回收");
+  if (note === null) return;
+  try {
+    const r = await api(`/batches/${encodeURIComponent(ref)}/seal`,
+      { method: "POST", body: { note } });
+    toast(r.replay ? "批次此前已封存，返回第一次结果"
+                   : `已封存 ${ref}，回收 ${fmtBytes(r.freed_bytes)}`, "ok");
+    loadArchiveTab(); loadBatches();
+  } catch (e) {
+    const reasons = e.data && e.data.reasons
+      ? "\n" + e.data.reasons.map((x) => "· " + x.message).join("\n") : "";
+    alert(e.message + reasons);
+  }
+}
+
+async function viewArchive(ref) {
+  let d;
+  try { d = await api("/archives/" + encodeURIComponent(ref)); }
+  catch (e) {
+    $("archiveDetail").classList.remove("hidden");
+    $("archiveDetail").innerHTML =
+      `<div class="blocker-box">⛔ <b>归档校验失败，已拒绝恢复</b>：${esc(e.message)}<br>
+        <span class="mono">${esc(JSON.stringify(e.data || {}))}</span></div>`;
+    return;
+  }
+  const rows = d.receipts.map((r) => `<tr>
+    <td>${r.seq}</td><td>${esc(r.receipt_no)}</td><td>${r.type_label}</td>
+    <td>${stateBadge(r.state)}</td><td>${r.attempts}</td>
+    <td class="mono">${esc((r.content_hash || "").slice(0, 16))}…</td>
+    <td>${r.forwarded_at ? fmtTs(r.forwarded_at) : ""}</td></tr>`).join("");
+  const auditRows = d.audit.map((e) => `<tr>
+    <td class="mono">${fmtTs(e.ts)}</td><td>${esc(e.kind)}</td>
+    <td>${e.seq ?? ""}</td><td>${esc(e.receipt_no)}</td><td>${esc(e.actor)}</td>
+    <td class="mono" style="max-width:360px;word-break:break-all">${esc(e.detail)}</td></tr>`).join("");
+  $("archiveDetail").classList.remove("hidden");
+  $("archiveDetail").innerHTML = `
+    <div class="row between">
+      <h3 style="margin:0">归档 ${esc(d.batch_ref)}（只读详情）</h3>
+      <button onclick="document.getElementById('archiveDetail').classList.add('hidden')">关闭</button>
+    </div>
+    <div class="ok-box">✅ <b>校验通过</b>：摘要 <code>${esc(d.digest.slice(0, 24))}…</code>
+      · 封存于 ${fmtTs(d.sealed_at)}（${esc(d.sealed_by)}）
+      · 回执 ${d.manifest.receipt_count} 条 · 原审计 ${d.manifest.audit_count} 行</div>
+    <p class="hint">${esc(d.manifest.batch_summary)} · 游标封存于 next_seq=${d.manifest.cursor_at_seal}
+      · 执行包哈希 <code>${esc(d.manifest.package_hash.slice(0, 16))}…</code>
+      ${d.note ? "· 备注：" + esc(d.note) : ""}</p>
+    <h3>回执明细（归档快照）</h3>
+    <table class="tbl"><thead><tr><th>序号</th><th>回执号</th><th>类型</th><th>状态</th>
+      <th>尝试</th><th>内容哈希</th><th>转发完成</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="muted">无回执</td></tr>`}</tbody></table>
+    <h3>原审计时间线</h3>
+    <table class="tbl"><thead><tr><th>时间</th><th>事件</th><th>序号</th><th>回执号</th>
+      <th>操作者</th><th>细节</th></tr></thead>
+      <tbody>${auditRows || `<tr><td colspan="6" class="muted">无审计记录</td></tr>`}</tbody></table>`;
+}
+$("storageRefresh").onclick = loadArchiveTab;
+
 // ------------------------------------------------------------ 审计
 async function loadAudit() {
   const [a, cf] = await Promise.all([api("/audit"), api("/conflicts")]);
@@ -347,6 +481,7 @@ function armTimer() {
       loadBatches();
       const active = document.querySelector(".tab.active");
       if (active && active.id === "tab-retries") loadQueue();
+      if (active && active.id === "tab-archive") loadArchiveTab();
       if (active && active.id === "tab-audit") loadAudit();
     }, 2000);
   }

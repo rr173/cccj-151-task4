@@ -53,6 +53,7 @@
 | 情况 | 结果 |
 |---|---|
 | 未知批次 | 404 `unknown_batch`，记冲突 |
+| 批次已封存 | 409 `batch_archived`（完全相同的历史回执按归档 `duplicate_replay` 重放） |
 | 批次摘要不匹配 | 409 `summary_mismatch`，记冲突 |
 | 完全相同回执（按规范化内容哈希）再次提交 | 200 `duplicate_replay`，返回原结果 |
 | 同 `seq` 内容不同 | 409 `conflict_seq`，**不推进游标** |
@@ -71,8 +72,52 @@
 
 ### 审计
 - `GET /relay/api/audit` — 审计流：导入/重放/冲突/派发/成功/退避重试/终态拒绝/
-  手动重试/租约回收/启动恢复。
-- `GET /relay/api/conflicts` — 被拒冲突留痕（同序异容、同号异容、摘要不符、未知批次）。
+  手动重试/租约回收/启动恢复/封存与归档校验。
+- `GET /relay/api/conflicts` — 被拒冲突留痕（同序异容、同号异容、摘要不符、未知批次、
+  已封存批次的回执）。
+
+## 磁盘回收：批次封存与只读归档
+
+中继磁盘按批次回收空间。只有**无缺口、无待重试/阻塞项且全部回执已结束
+（forwarded）**的批次允许封存；封存把热库回执明细与该批次审计行迁入只读归档，
+原审计时间线完整保留在归档内。
+
+- 封存是**单个 SQLite 事务**：内容清单 + 校验摘要 + 归档写入 + 热库删除 + 封存标记
+  同生共死；中途失败/进程崩溃整体回滚，不留半迁移状态。
+- 幂等：同一批次重复封存返回第一次结果（`replay:true`，同 digest/sealed_at）。
+- 封存后该批次新回执一律 **409 batch_archived**；完全相同的历史回执按归档
+  `duplicate_replay` 重放——**归档记录永不再次进入转发队列**。
+- 批次详情 `GET /relay/api/batches/{ref}` 对已封存批次自动从归档恢复只读视图
+  （`readonly:true`，含回执明细与原审计时间线）。
+
+### 预估占用
+`GET /relay/api/admin/storage`
+```json
+{"batches":[{"batch_ref":"B-001","archived":false,"sealable":true,
+             "reasons":[],"receipt_count":3,"receipt_bytes":900,
+             "audit_count":10,"audit_bytes":450,"hot_bytes":1350}],
+ "totals":{"hot_bytes":2232,"archive_bytes":0,"freed_bytes":0,"sealable":1,"archived":0}}
+```
+不可封存时 `reasons[]` 逐条给出原因：`has_gaps`（含缺口序号）、
+`pending_queued/dispatching/retry_wait/buffered/rejected_terminal`。
+
+### 执行封存（幂等，单事务）
+`POST /relay/api/batches/{ref}/seal` `{"note?":"月底空间回收"}`
+- 200：`{sealed:true, replay:false, digest, manifest, receipt_count, audit_count,
+  freed_bytes, sealed_at}`；重复调用 → `replay:true` 并返回第一次结果。
+- 进行中批次 → **409 batch_not_sealable**（`reasons[]` 同预估接口）。
+- 封存前完整性校验（逐条重算执行包/回执内容哈希）失败 → **409 checksum_mismatch**
+  （`errors[]` 指明不一致的条目），热库数据原样保留。
+
+### 归档列表 / 校验并恢复只读详情 / 下载
+- `GET /relay/api/archives` — 归档列表（digest、封存时间、回执/审计条数、回收字节）。
+- `GET /relay/api/archives/{ref}` — 重算校验摘要并恢复只读详情：
+  `{readonly:true, verification:{ok,...}, manifest, package, receipts[], audit[]}`。
+  摘要不一致 → **409 archive_corrupt**，拒绝恢复并记审计。
+- `GET /relay/api/archives/{ref}/download` — 下载完整归档 JSON
+  （`Content-Disposition: attachment`）。离线校验：去掉 `digest/sealed_at/
+  sealed_by/freed_bytes` 附加字段后，对剩余对象做规范化（键排序、无空白）
+  JSON 序列化并取 SHA-256，应等于 `digest`。
 
 ## 现场终端 API（只读）
 

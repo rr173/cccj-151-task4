@@ -15,6 +15,7 @@
     <button data-tab="terminal">现场终端下载</button>
     <button data-tab="upload">回执上传</button>
     <button data-tab="retries">失败重试</button>
+    <button data-tab="archive">归档封存</button>
     <button data-tab="audit">审计与冲突</button>
     <button data-tab="stub" class="hidden">桩适配器</button>
   </nav>
@@ -103,6 +104,31 @@
         <th>尝试</th><th>失败原因 / 结果</th><th>下次重试</th><th>操作</th></tr></thead>
       <tbody id="queueRows"></tbody>
     </table>
+  </section>
+
+  <!-- ============ 归档封存 ============ -->
+  <section id="tab-archive" class="tab">
+    <h2>磁盘空间回收：批次封存与只读归档</h2>
+    <p class="hint">只允许封存<b>无缺口、无待重试/阻塞项且全部回执已结束</b>的批次。
+      封存时生成内容清单与校验摘要，热库明细迁入只读归档；同一批次重复封存返回第一次结果；
+      进行中的批次或校验失败会被拒绝；归档记录永不再次进入转发队列，原审计时间线随归档保留。</p>
+    <div class="row between">
+      <h3 style="margin:0">热库占用预估</h3>
+      <button id="storageRefresh">刷新</button>
+    </div>
+    <div id="storageTotals" class="metrics" style="margin:10px 0"></div>
+    <table class="tbl">
+      <thead><tr><th>批次</th><th>回执明细</th><th>审计行</th><th>热库占用</th>
+        <th>封存资格</th><th>操作</th></tr></thead>
+      <tbody id="storageRows"></tbody>
+    </table>
+    <h3>只读归档</h3>
+    <table class="tbl">
+      <thead><tr><th>批次</th><th>校验摘要</th><th>回执</th><th>审计行</th>
+        <th>回收空间</th><th>封存时间</th><th>操作</th></tr></thead>
+      <tbody id="archiveRows"></tbody>
+    </table>
+    <div id="archiveDetail" class="detail-panel hidden"></div>
   </section>
 
   <!-- ============ 审计 ============ -->

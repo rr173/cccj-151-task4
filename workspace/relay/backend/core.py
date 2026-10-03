@@ -185,6 +185,12 @@ def ingest_receipt(db, raw, actor="api", commit=True):
     next_seq = cur["next_seq"]
     content_hash = sha256_hex(canonical(raw))
 
+    # ---- 已封存批次：完全相同→归档重放；否则拒绝。归档记录永不回到转发队列 ----
+    if pkg["archived"]:
+        import archive  # 延迟导入避免循环依赖
+        return archive.ingest_into_archived(db, pkg, raw, content_hash,
+                                            actor=actor, commit=commit)
+
     row = db.conn.execute(
         "SELECT * FROM receipts WHERE batch_ref=? AND seq=?", (batch_ref, seq)).fetchone()
     same_no = None if row else db.conn.execute(
@@ -314,6 +320,16 @@ def get_batch_detail(db, batch_ref):
     if not p:
         raise RelayError(404, "not_found", f"批次 {batch_ref} 不存在")
     view = _batch_summary(db, p)
+    if p["archived"]:
+        # 已封存：从只读归档恢复详情（校验摘要 + 回执明细 + 原审计时间线）
+        import archive
+        detail = archive.get_archive_detail(db, batch_ref, verify=True)
+        view["receipts"] = detail["receipts"]
+        view["audit"] = detail["audit"]
+        view["verification"] = detail["verification"]
+        view["readonly"] = True
+        view["payload"] = json.loads(p["payload"])
+        return view
     receipts = []
     for r in db.conn.execute(
             "SELECT * FROM receipts WHERE batch_ref=? ORDER BY seq", (batch_ref,)):
@@ -325,6 +341,7 @@ def get_batch_detail(db, batch_ref):
 
 def _batch_summary(db, prow):
     ref = str(prow["batch_ref"])
+    archived = bool(prow["archived"])
     cur = db.conn.execute("SELECT next_seq FROM cursors WHERE batch_ref=?",
                           (ref,)).fetchone()
     next_seq = cur["next_seq"] if cur else prow["seq_base"]
@@ -353,8 +370,16 @@ def _batch_summary(db, prow):
         "SELECT seq,receipt_no,result_code,result_detail,rejected_at FROM receipts"
         " WHERE batch_ref=? AND state='rejected_terminal' ORDER BY seq LIMIT 1",
         (ref,)).fetchone()
+    archive_meta = None
+    if archived:
+        a = db.conn.execute(
+            "SELECT digest,sealed_at,sealed_by,receipt_count,audit_count,freed_bytes"
+            " FROM archives WHERE batch_ref=?", (ref,)).fetchone()
+        archive_meta = dict(a) if a else None
     status = "idle"
-    if blocker:
+    if archived:
+        status = "archived"
+    elif blocker:
         status = "blocked_terminal"
     elif by_state.get("dispatching") or by_state.get("retry_wait"):
         status = "forwarding"
@@ -368,6 +393,7 @@ def _batch_summary(db, prow):
         "batch_summary": prow["batch_summary"], "seq_base": prow["seq_base"],
         "content_hash": prow["content_hash"], "source": prow["source"],
         "imported_at": prow["imported_at"],
+        "archived": archived, "archive": archive_meta,
         "cursor": next_seq, "max_seen": max_seen, "gaps": gaps,
         "buffered_items": buffered, "in_flight": waiters,
         "counts": {"buffered": by_state.get("buffered", 0),
@@ -436,6 +462,12 @@ def manual_retry(db, batch_ref, seq=None, actor="operator", note=""):
     if seq is not None:
         rows_q += " AND seq=?"
         params.append(seq)
+    pkg = db.conn.execute("SELECT archived FROM packages WHERE batch_ref=?",
+                          (batch_ref,)).fetchone()
+    if pkg and pkg["archived"]:
+        raise RelayError(409, "batch_archived",
+                         f"批次 {batch_ref} 已封存为只读归档，"
+                         "归档记录不再进入转发队列")
     rows = db.conn.execute(
         f"SELECT * FROM receipts WHERE {rows_q} ORDER BY seq", params).fetchall()
     if not rows:
@@ -464,6 +496,12 @@ def manual_retry(db, batch_ref, seq=None, actor="operator", note=""):
 
 
 def acknowledge_and_retry(db, batch_ref, seq, actor="operator", note=""):
+    pkg = db.conn.execute("SELECT archived FROM packages WHERE batch_ref=?",
+                          (batch_ref,)).fetchone()
+    if pkg and pkg["archived"]:
+        raise RelayError(409, "batch_archived",
+                         f"批次 {batch_ref} 已封存为只读归档，"
+                         "归档记录不再进入转发队列")
     r = db.conn.execute(
         "SELECT * FROM receipts WHERE batch_ref=? AND seq=?",
         (batch_ref, seq)).fetchone()
@@ -504,7 +542,29 @@ def recover_on_startup(db):
     pending = db.conn.execute(
         "SELECT COUNT(*) c FROM receipts WHERE state IN "
         "('queued','retry_wait','dispatching','buffered')").fetchone()["c"]
+    # 归档一致性防御校正：封存是单事务（归档行/热库删除/封存标记同生共死），
+    # 正常不会触发；若外部破坏导致标记与归档不一致，按归档为准回正。
+    repaired = 0
+    for r in db.conn.execute("SELECT batch_ref,archived FROM packages").fetchall():
+        has = db.conn.execute("SELECT 1 FROM archives WHERE batch_ref=?",
+                              (r["batch_ref"],)).fetchone()
+        if r["archived"] and not has:
+            db.conn.execute(
+                "UPDATE packages SET archived=0,archived_at=NULL WHERE batch_ref=?",
+                (r["batch_ref"],))
+            db.audit("archive_consistency_repair", r["batch_ref"],
+                     detail={"issue": "archived_flag_without_archive"})
+            repaired += 1
+        elif has and not r["archived"]:
+            db.conn.execute(
+                "UPDATE packages SET archived=1 WHERE batch_ref=?",
+                (r["batch_ref"],))
+            db.audit("archive_consistency_repair", r["batch_ref"],
+                     detail={"issue": "archive_without_flag"})
+            repaired += 1
     db.audit("relay_started", detail={"recovered_leases": len(stale),
-                                      "pending_rows": pending})
+                                      "pending_rows": pending,
+                                      "archive_repairs": repaired})
     db.commit()
-    return {"recovered_leases": len(stale), "pending_rows": pending}
+    return {"recovered_leases": len(stale), "pending_rows": pending,
+            "archive_repairs": repaired}

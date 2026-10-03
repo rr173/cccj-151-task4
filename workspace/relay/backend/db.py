@@ -93,6 +93,22 @@ CREATE TABLE IF NOT EXISTS audit_log(
   detail     TEXT NOT NULL DEFAULT ''
 );
 
+-- 只读归档：批次封存时生成的内容清单 + 校验摘要 + 明细快照（热库空间回收的去处）
+CREATE TABLE IF NOT EXISTS archives(
+  batch_ref     TEXT PRIMARY KEY,
+  package_id    TEXT NOT NULL DEFAULT '',
+  batch_summary TEXT NOT NULL DEFAULT '',
+  digest        TEXT NOT NULL,              -- 校验摘要：sha256(规范化 清单+全部明细+审计时间线)
+  manifest      TEXT NOT NULL,              -- 内容清单 JSON（每条回执的序号/编号/哈希等）
+  payload       TEXT NOT NULL,              -- 完整归档 JSON（执行包+回执明细+原审计时间线）
+  receipt_count INTEGER NOT NULL DEFAULT 0,
+  audit_count   INTEGER NOT NULL DEFAULT 0,
+  freed_bytes   INTEGER NOT NULL DEFAULT 0, -- 封存时从热库回收的字节数
+  sealed_at     REAL NOT NULL,
+  sealed_by     TEXT NOT NULL DEFAULT 'system',
+  note          TEXT NOT NULL DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_receipts_dispatch
   ON receipts(state, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_receipts_batch ON receipts(batch_ref, seq);
@@ -110,7 +126,17 @@ class RelayDB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self):
+        """轻量迁移：为既有库补充封存归档所需的列（表由 SCHEMA 幂等创建）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(packages)")}
+        if "archived" not in cols:
+            self.conn.execute(
+                "ALTER TABLE packages ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        if "archived_at" not in cols:
+            self.conn.execute("ALTER TABLE packages ADD COLUMN archived_at REAL")
 
     # ---- meta ----
     def get_meta(self, key, default=None):

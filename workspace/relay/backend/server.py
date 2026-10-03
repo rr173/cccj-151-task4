@@ -14,6 +14,11 @@ API 总览（详见 relay/API.md）：
           POST /relay/api/batches/{ref}/receipts/{seq}/ack-terminal
           GET  /relay/api/audit                     审计流
           GET  /relay/api/conflicts                 被拒冲突
+  封存    GET  /relay/api/admin/storage             热库占用预估与封存资格
+          POST /relay/api/batches/{ref}/seal        执行封存（幂等，单事务）
+          GET  /relay/api/archives                  只读归档列表
+          GET  /relay/api/archives/{ref}            校验并恢复只读详情（含原审计时间线）
+          GET  /relay/api/archives/{ref}/download   下载归档 JSON（可离线校验）
   现场终端 GET /relay/api/terminal/manifest          可下载批次清单
           GET  /relay/api/terminal/packages/{ref}   下载不可变执行包（含摘要）
   运维    GET  /relay/api/health
@@ -25,6 +30,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import archive
 import core
 from adapters import build_adapter
 from db import RelayDB
@@ -96,6 +102,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _bad_json(self):
         raise core.RelayError(400, "malformed", "请求体不是合法 JSON")
+
+    def _download(self, filename, obj):
+        data = json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _static(self, path):
         if path in ("", "/"):
@@ -170,6 +186,19 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/relay/api/conflicts":
                 return self._json(200, {"conflicts": core.recent_conflicts(a.db)})
 
+            if p == "/relay/api/admin/storage":
+                return self._json(200, archive.estimate_storage(a.db))
+            if p == "/relay/api/archives":
+                return self._json(200, {"archives": archive.list_archives(a.db)})
+            if p.startswith("/relay/api/archives/"):
+                parts = p.strip("/").split("/")
+                ref = parts[3]
+                if len(parts) == 4:
+                    return self._json(200, archive.get_archive_detail(a.db, ref))
+                if len(parts) == 5 and parts[4] == "download":
+                    doc = archive.archive_document(a.db, ref)
+                    return self._download(f"relay-archive-{ref}.json", doc)
+
             if p.startswith("/relay/api/batches/"):
                 parts = p.strip("/").split("/")
                 ref = parts[3]
@@ -229,6 +258,12 @@ class Handler(BaseHTTPRequestHandler):
                 a.forwarder.kick()
                 return self._json(200, res)
 
+            if p.startswith("/relay/api/batches/") and p.endswith("/seal"):
+                ref = p.strip("/").split("/")[3]
+                res = archive.seal_batch(a.db, ref, actor=actor,
+                                         note=str(body.get("note", "")))
+                return self._json(200, res)
+
             if p.startswith("/relay/api/batches/") and p.endswith("/ack-terminal"):
                 parts = p.strip("/").split("/")
                 ref, seq = parts[3], int(parts[5])
@@ -263,13 +298,20 @@ class Handler(BaseHTTPRequestHandler):
 def _terminal_manifest(a_db):
     out = []
     for p in a_db.conn.execute(
-            "SELECT batch_ref,package_id,batch_summary,source,imported_at,content_hash"
-            " FROM packages ORDER BY imported_at"):
+            "SELECT batch_ref,package_id,batch_summary,source,imported_at,"
+            "content_hash,archived FROM packages ORDER BY imported_at"):
         d = dict(p)
-        cur = a_db.conn.execute(
-            "SELECT COUNT(*) c FROM receipts WHERE batch_ref=? AND state='forwarded'",
-            (p["batch_ref"],)).fetchone()
-        d["forwarded_receipts"] = cur["c"]
+        if d.get("archived"):
+            # 已封存：热库明细已迁入归档，已转发数取归档清单
+            arch = a_db.conn.execute(
+                "SELECT receipt_count FROM archives WHERE batch_ref=?",
+                (p["batch_ref"],)).fetchone()
+            d["forwarded_receipts"] = arch["receipt_count"] if arch else 0
+        else:
+            cur = a_db.conn.execute(
+                "SELECT COUNT(*) c FROM receipts WHERE batch_ref=? AND state='forwarded'",
+                (p["batch_ref"],)).fetchone()
+            d["forwarded_receipts"] = cur["c"]
         d["download"] = f"/relay/api/terminal/packages/{p['batch_ref']}"
         out.append(d)
     return out
