@@ -70,7 +70,8 @@ python3 seed_demo.py --reset
 [relay/](relay/) 是与本系统通过**出站执行包 + 回调接口**相连的独立服务
 （端口 8090，独立数据库/容器）：不可变批次包供现场终端下载，接收带批次摘要、
 回执编号与递增序号的「已离场/未能出发/到达确认」回执，在乱序、重复、断网下
-保证按序、恰好一次回调。
+保证按序、恰好一次回调；已完结批次可**封存归档**回收中继磁盘
+（内容清单+校验摘要、只读恢复、归档永不回到转发队列）。
 
 - 主系统对接面：`GET /api/execution-packages`、
   `GET /api/execution-package/v1/{batch_id}`、`POST /api/relay-callback`

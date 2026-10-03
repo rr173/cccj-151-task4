@@ -93,6 +93,26 @@ CREATE TABLE IF NOT EXISTS audit_log(
   detail     TEXT NOT NULL DEFAULT ''
 );
 
+-- 批次归档（只读封存）：已完结批次的热库明细迁入此处以回收磁盘空间。
+-- 封存为单事务（写归档 + 删热库 receipts/cursors），崩溃不会留下半迁移状态；
+-- 归档记录永不回到转发队列；原审计时间线保留在 audit_log，归档包内另存快照。
+CREATE TABLE IF NOT EXISTS archives(
+  batch_ref      TEXT PRIMARY KEY,          -- 被封存的批次（一批次只封存一次）
+  archive_id     TEXT NOT NULL UNIQUE,      -- 归档编号
+  manifest_hash  TEXT NOT NULL,             -- 内容清单校验摘要（sha256）
+  manifest       TEXT NOT NULL,             -- 内容清单 JSON（逐条回执哈希/计数/游标终值）
+  payload        TEXT NOT NULL,             -- 完整归档包 JSON（清单+执行包+回执明细+审计快照）
+  receipt_count  INTEGER NOT NULL,
+  audit_count    INTEGER NOT NULL,
+  cursor_final   INTEGER,                   -- 封存时游标终值
+  bytes_estimate INTEGER NOT NULL DEFAULT 0,-- 封存时回收的热库字节估计
+  sealed_at      REAL NOT NULL,
+  sealed_by      TEXT NOT NULL DEFAULT 'system',
+  restored_at    REAL,                      -- 首次「校验并恢复只读详情」时间
+  last_verify_at REAL,
+  last_verify_ok INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_receipts_dispatch
   ON receipts(state, next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_receipts_batch ON receipts(batch_ref, seq);

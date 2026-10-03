@@ -35,6 +35,12 @@ function fmtTs(ts) {
   const d = new Date(ts * 1000);
   return d.toLocaleString("zh-CN", { hour12: false });
 }
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / 1024 / 1024).toFixed(2) + " MB";
+}
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -56,6 +62,7 @@ document.querySelectorAll(".topbar nav button").forEach((btn) => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "terminal") loadTerminal();
     if (btn.dataset.tab === "retries") loadQueue();
+    if (btn.dataset.tab === "archive") loadArchives();
     if (btn.dataset.tab === "audit") loadAudit();
     if (btn.dataset.tab === "stub") loadStub();
   });
@@ -116,13 +123,19 @@ async function loadBatches() {
 
 function statusText(s) {
   return { idle: "等待回执", collecting: "收集中", forwarding: "转发中",
-           blocked_terminal: "终态阻塞", all_forwarded: "全部转发完成" }[s] || s;
+           blocked_terminal: "终态阻塞", all_forwarded: "全部转发完成",
+           archived: "已封存(只读)" }[s] || s;
 }
 
 async function loadBatchDetail(ref) {
   selectedBatch = ref;
   const b = await api("/batches/" + encodeURIComponent(ref));
   const c = b.counts;
+  const archivedBox = b.archived
+    ? `<div class="archive-box">📦 <b>批次已封存（只读归档）</b>：归档编号
+        <code>${esc(b.archive_id)}</code> · 封存于 ${fmtTs(b.sealed_at)} ·
+        已回收约 ${fmtBytes(b.bytes_reclaimed)}。${esc(b.message || "")}
+        ${b.restored ? "" : `可到「归档封存」页校验并恢复只读详情。`}</div>` : "";
   const blocked = b.blocker
     ? `<div class="blocker-box">⛔ <b>终态拒绝（游标冻结）</b>：序号 ${b.blocker.seq}
         回执 ${esc(b.blocker.receipt_no)} 被主系统拒绝（<code>${esc(b.blocker.result_code)}</code>）。
@@ -152,7 +165,7 @@ async function loadBatchDetail(ref) {
     </div>
     <p class="hint">${esc(b.batch_summary)} · 游标 next_seq=<b>${b.cursor}</b>
       · 最大已见序号 ${b.max_seen ?? "—"} · 缺口 [${b.gaps.join(", ") || "无"}]</p>
-    ${blocked}${buffered}
+    ${archivedBox}${blocked}${buffered}
     <table class="tbl"><thead><tr>
       <th>序号</th><th>回执号</th><th>类型</th><th>状态</th><th>尝试</th>
       <th>转发结果 / 失败原因</th><th>时间</th></tr></thead>
@@ -197,7 +210,7 @@ $("importBtn").onclick = async () => {
 async function loadTerminal() {
   const d = await api("/terminal/manifest");
   $("terminalRows").innerHTML = d.batches.map((b) => `<tr>
-    <td><b>${esc(b.batch_ref)}</b></td>
+    <td><b>${esc(b.batch_ref)}</b>${b.archived ? ' <span class="badge archived">已封存</span>' : ""}</td>
     <td>${esc(b.batch_summary)}</td>
     <td class="mono">${esc(b.content_hash.slice(0, 20))}…</td>
     <td>${b.forwarded_receipts}</td>
@@ -282,6 +295,114 @@ async function loadQueue() {
 }
 $("queueRefresh").onclick = loadQueue;
 
+// ------------------------------------------------------------ 归档封存
+async function loadArchives() {
+  const [est, arch] = await Promise.all([api("/archives/estimate"), api("/archives")]);
+  $("archSummary").textContent =
+    `热库回执明细约 ${fmtBytes(est.hot_receipt_bytes)} · ` +
+    `可封存回收约 ${fmtBytes(est.total_reclaimable_bytes)} · ` +
+    `已封存 ${arch.archives.length} 个批次`;
+
+  const pending = est.batches.filter((b) => !b.archived);
+  $("archEstRows").innerHTML = pending.map((b) => {
+    const blockers = (b.blockers || []).map((x) => esc(x.message)).join("；");
+    return `<tr>
+      <td><b>${esc(b.batch_ref)}</b></td>
+      <td><span class="badge ${b.status}">${statusText(b.status)}</span></td>
+      <td>${b.receipt_count}（已转发 ${b.forwarded}）</td>
+      <td>${fmtBytes(b.bytes_estimate)}</td>
+      <td>${b.eligible ? '<span class="ok-text">✔ 可封存</span>'
+                       : '<span class="err-text">✘ 未完结</span>'}</td>
+      <td class="err-text">${blockers}</td>
+      <td>${b.eligible
+        ? `<button class="primary" data-seal="${esc(b.batch_ref)}">执行封存</button>`
+        : '<span class="muted">—</span>'}</td></tr>`;
+  }).join("") || `<tr><td colspan="7" class="muted">没有待评估批次</td></tr>`;
+
+  $("archRows").innerHTML = arch.archives.map((a) => `<tr>
+    <td><b>${esc(a.batch_ref)}</b></td>
+    <td class="mono">${esc(a.archive_id)}</td>
+    <td class="mono" title="${esc(a.manifest_hash)}">${esc(a.manifest_hash.slice(0, 16))}…</td>
+    <td>${a.receipt_count} / ${a.audit_count}</td>
+    <td>${fmtBytes(a.bytes_estimate)}</td>
+    <td>${fmtTs(a.sealed_at)}</td>
+    <td>${a.restored_at ? "✅ 已恢复 " + fmtTs(a.restored_at) : '<span class="muted">未恢复</span>'}
+        ${a.last_verify_ok === false ? '<div class="err-text">上次校验失败</div>' : ""}</td>
+    <td><div class="row" style="gap:4px;flex-wrap:wrap">
+      <button data-dl="${esc(a.batch_ref)}">下载归档</button>
+      <button data-verify="${esc(a.batch_ref)}">校验</button>
+      <button data-restore="${esc(a.batch_ref)}">校验并恢复只读详情</button>
+      ${a.restored_at ? `<button data-detail="${esc(a.batch_ref)}">查看</button>` : ""}
+    </div></td></tr>`).join("")
+    || `<tr><td colspan="8" class="muted">暂无归档</td></tr>`;
+
+  $("archEstRows").querySelectorAll("button[data-seal]").forEach((btn) =>
+    btn.addEventListener("click", () => sealBatch(btn.dataset.seal)));
+  $("archRows").querySelectorAll("button").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const ref = btn.dataset.dl || btn.dataset.verify || btn.dataset.restore || btn.dataset.detail;
+      try {
+        if (btn.dataset.dl) {
+          window.open(`/relay/api/archives/${encodeURIComponent(ref)}/download`, "_blank");
+          toast("归档包已开始下载（字节一致，可离线校验）", "ok");
+        } else if (btn.dataset.verify) {
+          const r = await api(`/archives/${encodeURIComponent(ref)}/verify`, { method: "POST", body: {} });
+          toast(`校验通过：${r.manifest_hash.slice(0, 16)}…`, "ok");
+          loadArchives();
+        } else if (btn.dataset.restore) {
+          const r = await api(`/archives/${encodeURIComponent(ref)}/restore`, { method: "POST", body: {} });
+          toast(r.message, "ok");
+          renderArchivedDetail(r.detail);
+          loadArchives();
+        } else if (btn.dataset.detail) {
+          const d = await api(`/archives/${encodeURIComponent(ref)}/detail`);
+          renderArchivedDetail(d);
+        }
+      } catch (e) {
+        toast(e.message, "err");
+        loadArchives();
+      }
+    });
+  });
+}
+
+async function sealBatch(ref) {
+  if (!confirm(`确认封存批次 ${ref}？\n热库明细将迁入只读归档（操作不可逆，归档仍可下载/恢复只读查看）。`)) return;
+  try {
+    const r = await api("/archives/seal", { method: "POST", body: { batch_ref: ref } });
+    toast(r.replay ? "该批次已封存过，返回首次结果" :
+      `已封存 ${r.receipt_count} 条回执，回收约 ${fmtBytes(r.bytes_reclaimed)}`, "ok");
+    loadArchives(); loadBatches();
+  } catch (e) {
+    toast(e.message, "err");
+    loadArchives();
+  }
+}
+
+function renderArchivedDetail(d) {
+  const rows = (d.receipts || []).map((r) => `<tr>
+    <td>${r.seq}</td><td>${esc(r.receipt_no)}</td><td>${r.type_label}</td>
+    <td>${stateBadge(r.state)}</td><td>${r.attempts}</td>
+    <td class="ok-text">${esc(r.result_detail || r.result_code || "")}</td>
+    <td>${r.forwarded_at ? "✅ " + fmtTs(r.forwarded_at) : ""}</td></tr>`).join("");
+  $("archDetail").classList.remove("hidden");
+  $("archDetail").innerHTML = `
+    <div class="row between">
+      <h2 style="margin:0">归档 ${esc(d.batch_ref)} <span class="badge archived">只读</span></h2>
+      <button onclick="document.getElementById('archDetail').classList.add('hidden')">关闭</button>
+    </div>
+    <div class="archive-box">📦 归档编号 <code>${esc(d.archive_id)}</code> ·
+      校验摘要 <code>${esc(d.manifest_hash)}</code> · 封存于 ${fmtTs(d.sealed_at)} ·
+      已回收约 ${fmtBytes(d.bytes_reclaimed)}。明细来自只读归档包，不会回到转发队列；
+      原审计时间线在「审计与冲突」页完整保留。</div>
+    <p class="hint">${esc(d.batch_summary)} · 游标终值 ${d.cursor} ·
+      回执 ${d.counts.forwarded} 条（全部已转发）</p>
+    <table class="tbl"><thead><tr><th>序号</th><th>回执号</th><th>类型</th><th>最终状态</th>
+      <th>尝试</th><th>转发结果</th><th>时间</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7" class="muted">该批次无回执</td></tr>`}</tbody></table>`;
+}
+$("archRefresh").onclick = loadArchives;
+
 // ------------------------------------------------------------ 审计
 async function loadAudit() {
   const [a, cf] = await Promise.all([api("/audit"), api("/conflicts")]);
@@ -347,6 +468,7 @@ function armTimer() {
       loadBatches();
       const active = document.querySelector(".tab.active");
       if (active && active.id === "tab-retries") loadQueue();
+      if (active && active.id === "tab-archive") loadArchives();
       if (active && active.id === "tab-audit") loadAudit();
     }, 2000);
   }

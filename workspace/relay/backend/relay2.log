@@ -1,10 +1,10 @@
 离线车队回执中继已启动: http://127.0.0.1:18092/relay/
-数据库: /tmp/relay-integ-jduqddc7/relay.db  回调适配器: http
+数据库: /tmp/relay-integ-r9b2l6vf/relay.db  回调适配器: http
 [relay] "GET /relay/api/health HTTP/1.1" 200 -
-[relay] "GET /relay/api/batches/batch_dc55f8257365 HTTP/1.1" 200 -
-[relay] "GET /relay/api/batches/batch_96c4debfd0ae HTTP/1.1" 200 -
+[relay] "GET /relay/api/batches/batch_ea204e1c7971 HTTP/1.1" 200 -
+[relay] "GET /relay/api/batches/batch_87f118355946 HTTP/1.1" 200 -
 [relay] "POST /relay/api/packages/import HTTP/1.1" 201 -
 [relay] "POST /relay/api/receipts/batch HTTP/1.1" 200 -
-[relay] "GET /relay/api/batches/batch_461db320c514 HTTP/1.1" 200 -
-[relay] "GET /relay/api/batches/batch_461db320c514 HTTP/1.1" 200 -
+[relay] "GET /relay/api/batches/batch_7fb174ce8fdd HTTP/1.1" 200 -
+[relay] "GET /relay/api/batches/batch_7fb174ce8fdd HTTP/1.1" 200 -
 [relay] "GET /relay/api/terminal/manifest HTTP/1.1" 200 -

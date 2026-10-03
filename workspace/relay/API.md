@@ -53,6 +53,7 @@
 | 情况 | 结果 |
 |---|---|
 | 未知批次 | 404 `unknown_batch`，记冲突 |
+| 批次已封存归档 | 409 `batch_archived`，记冲突；归档记录永不回到转发队列 |
 | 批次摘要不匹配 | 409 `summary_mismatch`，记冲突 |
 | 完全相同回执（按规范化内容哈希）再次提交 | 200 `duplicate_replay`，返回原结果 |
 | 同 `seq` 内容不同 | 409 `conflict_seq`，**不推进游标** |
@@ -71,8 +72,41 @@
 
 ### 审计
 - `GET /relay/api/audit` — 审计流：导入/重放/冲突/派发/成功/退避重试/终态拒绝/
-  手动重试/租约回收/启动恢复。
-- `GET /relay/api/conflicts` — 被拒冲突留痕（同序异容、同号异容、摘要不符、未知批次）。
+  手动重试/租约回收/启动恢复/封存/校验/恢复。
+- `GET /relay/api/conflicts` — 被拒冲突留痕（同序异容、同号异容、摘要不符、未知批次、
+  已封存批次）。
+
+## 归档封存 API（按批次回收磁盘空间）
+
+只有**无序号缺口、无待转发/缓冲/派发/退避项、无终态阻塞**（即全部回执已终态成功）
+的批次可以封存。封存把热库回执明细迁入只读归档表，释放热库空间；
+写归档 + 删热库明细 + 删游标在**同一事务**完成，进程崩溃/重启不会留下半迁移状态
+（启动恢复另有兜底清扫）。原审计时间线保留在 `audit_log`，归档包内另存快照。
+
+- `GET /relay/api/archives/estimate` — 封存评估：每批次 `eligible`、`blockers[]`
+  （缺口/待重试/阻塞原因）、`bytes_estimate`（待回收估计）、`audit_events`；
+  汇总 `total_reclaimable_bytes` 与当前 `hot_receipt_bytes`。
+- `POST /relay/api/archives/seal` `{"batch_ref":"B-001"}`
+  — 201 首次封存：返回 `archive_id`、`manifest_hash`（内容清单校验摘要）、
+  `receipt_count`、`cursor_final`、`bytes_reclaimed`。
+  同一批次重复封存 → 200 `replay:true`，返回**第一次**结果。
+  进行中批次 → 409 `batch_not_sealable`（附 `blockers`）；
+  封存前逐条复核热库内容哈希，失败 → 409 `checksum_mismatch`，热库原样保留。
+- `GET /relay/api/archives` — 归档列表（编号、摘要、计数、封存/恢复/校验时间）。
+- `GET /relay/api/archives/{ref}` — 归档元信息 + 完整内容清单（manifest）。
+- `GET /relay/api/archives/{ref}/download` — 下载归档包
+  （清单 + 执行包原文 + 回执明细 + 审计快照），重复下载字节一致，
+  响应头带 `X-Manifest-Hash`，可离线复核。
+- `POST /relay/api/archives/{ref}/verify` — 按清单深度复核归档包
+  （清单摘要/执行包哈希/逐条回执哈希/审计计数）；失败 → 409 `checksum_mismatch`。
+- `POST /relay/api/archives/{ref}/restore` — **先校验再恢复只读详情**：
+  校验失败拒绝；成功后 `GET /relay/api/batches/{ref}` 与
+  `GET /relay/api/archives/{ref}/detail` 返回从归档包还原的只读明细
+  （`read_only:true`）。恢复不写回热库，重复恢复返回首次状态（幂等）。
+- `GET /relay/api/archives/{ref}/detail` — 只读归档详情；未恢复 → 409 `not_restored`。
+
+封存后的行为：该批次回执一律 409 `batch_archived`；重试/终态确认同样拒绝；
+游标已删除、转发器跳过归档批次，**归档记录永不再次进入转发队列**。
 
 ## 现场终端 API（只读）
 

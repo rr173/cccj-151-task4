@@ -147,6 +147,18 @@ def _validate_receipt(db, raw):
                                           "_content_hash": "", **raw} if isinstance(raw, dict)
                         else {"_raw": raw}, f"批次 {batch_ref} 未导入执行包")
         raise RelayError(404, "unknown_batch", f"批次 {batch_ref} 的执行包尚未导入")
+    if db.conn.execute("SELECT 1 FROM archives WHERE batch_ref=?",
+                       (batch_ref,)).fetchone():
+        seq_val = raw.get("seq") if isinstance(raw.get("seq"), int) else None
+        db.add_conflict("batch_archived",
+                        {"_raw": raw, "batch_ref": batch_ref, "seq": seq_val,
+                         "receipt_no": str(raw.get("receipt_no", ""))},
+                        "批次已封存归档，回执不再受理")
+        db.audit("receipt_rejected_archived", batch_ref, seq=seq_val,
+                 receipt_no=str(raw.get("receipt_no", "")),
+                 detail={"reason": "batch_archived"})
+        raise RelayError(409, "batch_archived",
+                         f"批次 {batch_ref} 已封存归档（只读），回执不再受理")
     if str(raw["batch_summary"]) != pkg["batch_summary"]:
         db.add_conflict("summary_mismatch", {"_raw": raw, **raw},
                         "回执批次摘要与执行包不一致")
@@ -176,7 +188,12 @@ def ingest_receipt(db, raw, actor="api", commit=True):
     commit=False 时只写事务不提交，供批量上传在外层统一提交/回滚。
     """
     raw = _normalize_receipt_input(raw)
-    pkg, seq = _validate_receipt(db, raw)
+    try:
+        pkg, seq = _validate_receipt(db, raw)
+    except RelayError:
+        if commit:
+            db.commit()  # 单条上传被拒：冲突/审计留痕立即持久化
+        raise
     batch_ref = pkg["batch_ref"]
     receipt_no = str(raw["receipt_no"]).strip()
     rtype = str(raw["type"])
@@ -313,6 +330,10 @@ def get_batch_detail(db, batch_ref):
                         (batch_ref,)).fetchone()
     if not p:
         raise RelayError(404, "not_found", f"批次 {batch_ref} 不存在")
+    if db.conn.execute("SELECT 1 FROM archives WHERE batch_ref=?",
+                       (batch_ref,)).fetchone():
+        import archive  # 延迟导入避免循环依赖
+        return archive.archived_batch_detail(db, batch_ref)
     view = _batch_summary(db, p)
     receipts = []
     for r in db.conn.execute(
@@ -325,6 +346,29 @@ def get_batch_detail(db, batch_ref):
 
 def _batch_summary(db, prow):
     ref = str(prow["batch_ref"])
+    arch = db.conn.execute(
+        "SELECT archive_id,manifest_hash,sealed_at,restored_at,receipt_count,"
+        "cursor_final,bytes_estimate FROM archives WHERE batch_ref=?",
+        (ref,)).fetchone()
+    if arch:
+        # 已封存批次：热库明细已迁入只读归档，卡片只展示归档元信息
+        return {
+            "batch_ref": ref, "package_id": prow["package_id"],
+            "batch_summary": prow["batch_summary"], "seq_base": prow["seq_base"],
+            "content_hash": prow["content_hash"], "source": prow["source"],
+            "imported_at": prow["imported_at"],
+            "cursor": arch["cursor_final"], "max_seen": None, "gaps": [],
+            "buffered_items": [], "in_flight": [],
+            "counts": {"buffered": 0, "queued": 0, "dispatching": 0,
+                       "retry_wait": 0, "forwarded": arch["receipt_count"],
+                       "rejected_terminal": 0},
+            "blocker": None, "status": "archived",
+            "archive": {"archive_id": arch["archive_id"],
+                        "manifest_hash": arch["manifest_hash"],
+                        "sealed_at": arch["sealed_at"],
+                        "restored": arch["restored_at"] is not None,
+                        "bytes_reclaimed": arch["bytes_estimate"]},
+        }
     cur = db.conn.execute("SELECT next_seq FROM cursors WHERE batch_ref=?",
                           (ref,)).fetchone()
     next_seq = cur["next_seq"] if cur else prow["seq_base"]
@@ -430,7 +474,12 @@ def manual_retry(db, batch_ref, seq=None, actor="operator", note=""):
     * rejected_terminal（终态拒绝）→ 默认拒绝；只有明确确认主系统已解除终态
       （批次恢复/车辆或目的地改回）时，携带 acknowledge_terminal=true 才允许重投，
       全程审计。游标从未被该终态项推进，因此重投成功后仍按序前推。
+    * 已封存归档的批次一律拒绝：归档记录不能重新进入转发队列。
     """
+    if db.conn.execute("SELECT 1 FROM archives WHERE batch_ref=?",
+                       (batch_ref,)).fetchone():
+        raise RelayError(409, "batch_archived",
+                         f"批次 {batch_ref} 已封存归档，归档记录不能重新进入转发队列")
     rows_q = "batch_ref=?"
     params = [batch_ref]
     if seq is not None:
@@ -464,6 +513,10 @@ def manual_retry(db, batch_ref, seq=None, actor="operator", note=""):
 
 
 def acknowledge_and_retry(db, batch_ref, seq, actor="operator", note=""):
+    if db.conn.execute("SELECT 1 FROM archives WHERE batch_ref=?",
+                       (batch_ref,)).fetchone():
+        raise RelayError(409, "batch_archived",
+                         f"批次 {batch_ref} 已封存归档，归档记录不能重新进入转发队列")
     r = db.conn.execute(
         "SELECT * FROM receipts WHERE batch_ref=? AND seq=?",
         (batch_ref, seq)).fetchone()
@@ -487,6 +540,8 @@ def recover_on_startup(db):
 
     forwarded 行永不被回收 → 不会重复调用已成功的回调；
     retry_wait 保持其退避时刻不变。
+    另兜底清扫已封存批次残留的热库行（正常封存为单事务不会残留），
+    保证归档记录在任何情况下都不会重新进入转发队列。
     """
     t = now()
     stale = db.conn.execute(
@@ -501,10 +556,14 @@ def recover_on_startup(db):
         db.audit("startup_recovery", r["batch_ref"], seq=r["seq"],
                  receipt_no=r["receipt_no"],
                  detail={"previous_attempts": r["attempts"]})
+    import archive  # 延迟导入避免循环依赖
+    sweep = archive.sweep_archived_hot_rows(db)
     pending = db.conn.execute(
         "SELECT COUNT(*) c FROM receipts WHERE state IN "
         "('queued','retry_wait','dispatching','buffered')").fetchone()["c"]
     db.audit("relay_started", detail={"recovered_leases": len(stale),
-                                      "pending_rows": pending})
+                                      "pending_rows": pending,
+                                      "archive_sweep": sweep})
     db.commit()
-    return {"recovered_leases": len(stale), "pending_rows": pending}
+    return {"recovered_leases": len(stale), "pending_rows": pending,
+            "archive_sweep": sweep}

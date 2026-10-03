@@ -100,7 +100,10 @@ class Forwarder:
         with self.db.lock:
             self._reap_expired_leases_locked()
             t = time.time()
-            cursors = self.db.conn.execute("SELECT batch_ref,next_seq FROM cursors").fetchall()
+            # 已封存批次不参与派发（正常封存已删游标；此处兜底，归档记录永不入队）
+            cursors = self.db.conn.execute(
+                "SELECT batch_ref,next_seq FROM cursors"
+                " WHERE batch_ref NOT IN (SELECT batch_ref FROM archives)").fetchall()
             for c in cursors:
                 batch_ref, seq = c["batch_ref"], c["next_seq"]
                 r = self.db.conn.execute(

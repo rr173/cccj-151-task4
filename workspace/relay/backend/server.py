@@ -14,8 +14,16 @@ API 总览（详见 relay/API.md）：
           POST /relay/api/batches/{ref}/receipts/{seq}/ack-terminal
           GET  /relay/api/audit                     审计流
           GET  /relay/api/conflicts                 被拒冲突
+  归档    GET  /relay/api/archives/estimate         封存评估（可封存性 + 占用预估）
+          POST /relay/api/archives/seal             执行封存（幂等；进行中/校验失败拒绝）
+          GET  /relay/api/archives                  归档列表
+          GET  /relay/api/archives/{ref}            归档元信息 + 内容清单
+          GET  /relay/api/archives/{ref}/download   下载归档包（字节一致）
+          GET  /relay/api/archives/{ref}/detail     只读详情（需先恢复）
+          POST /relay/api/archives/{ref}/verify     校验归档完整性
+          POST /relay/api/archives/{ref}/restore    校验并恢复只读详情
   现场终端 GET /relay/api/terminal/manifest          可下载批次清单
-          GET  /relay/api/terminal/packages/{ref}   下载不可变执行包（含摘要）
+          GET /relay/api/terminal/packages/{ref}   下载不可变执行包（含摘要）
   运维    GET  /relay/api/health
           POST /relay/api/admin/stub                stub 适配器规则注入
           POST /relay/api/admin/recover             手动触发重启恢复逻辑
@@ -25,6 +33,7 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import archive
 import core
 from adapters import build_adapter
 from db import RelayDB
@@ -170,6 +179,22 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/relay/api/conflicts":
                 return self._json(200, {"conflicts": core.recent_conflicts(a.db)})
 
+            if p == "/relay/api/archives":
+                return self._json(200, {"archives": archive.list_archives(a.db)})
+            if p == "/relay/api/archives/estimate":
+                return self._json(200, archive.estimate_all(a.db))
+            if p.startswith("/relay/api/archives/"):
+                parts = p.strip("/").split("/")
+                ref = parts[3]
+                if len(parts) == 4:
+                    return self._json(200, archive.get_archive_meta(a.db, ref))
+                if len(parts) == 5 and parts[4] == "download":
+                    return self._download_archive(a, ref)
+                if len(parts) == 5 and parts[4] == "detail":
+                    return self._json(
+                        200, archive.archived_batch_detail(a.db, ref,
+                                                           require_restored=True))
+
             if p.startswith("/relay/api/batches/"):
                 parts = p.strip("/").split("/")
                 ref = parts[3]
@@ -257,7 +282,39 @@ class Handler(BaseHTTPRequestHandler):
             if p == "/relay/api/admin/recover":
                 return self._json(200, core.recover_on_startup(a.db))
 
+            if p == "/relay/api/archives/seal":
+                res = archive.seal_batch(a.db, str(body.get("batch_ref", "")),
+                                         actor=actor)
+                return self._json(200 if res.get("replay") else 201, res)
+
+            if p.startswith("/relay/api/archives/"):
+                parts = p.strip("/").split("/")
+                ref = parts[3]
+                if len(parts) == 5 and parts[4] == "verify":
+                    return self._json(
+                        200, archive.verify_archive(a.db, ref, actor=actor))
+                if len(parts) == 5 and parts[4] == "restore":
+                    return self._json(
+                        200, archive.restore_archive(a.db, ref, actor=actor))
+
             raise core.RelayError(404, "not_found", "未知接口")
+
+
+    # ---- 归档下载（附件，字节一致）----
+    def _download_archive(self, a, ref):
+        archive_id, manifest_hash, payload = archive.get_archive_download(a.db, ref)
+        data = payload.encode("utf-8")
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in ref)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="relay-archive-{safe}.json"')
+        self.send_header("X-Archive-Id", archive_id)
+        self.send_header("X-Manifest-Hash", manifest_hash)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
 def _terminal_manifest(a_db):
@@ -270,6 +327,9 @@ def _terminal_manifest(a_db):
             "SELECT COUNT(*) c FROM receipts WHERE batch_ref=? AND state='forwarded'",
             (p["batch_ref"],)).fetchone()
         d["forwarded_receipts"] = cur["c"]
+        d["archived"] = bool(a_db.conn.execute(
+            "SELECT 1 FROM archives WHERE batch_ref=?",
+            (p["batch_ref"],)).fetchone())
         d["download"] = f"/relay/api/terminal/packages/{p['batch_ref']}"
         out.append(d)
     return out
